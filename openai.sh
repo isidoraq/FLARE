@@ -14,7 +14,7 @@ config_filename="${config_filename%.*}"
 
 debug_batch_size=1
 batch_size=8
-model=text-davinci-003
+model=gpt-3.5-turbo-0301
 temperature=0
 
 output=output/${dataset}/${model}/${config_filename}.jsonl

@@ -12,7 +12,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from beir.datasets.data_loader import GenericDataLoader
-from src.datasets import WikiMultiHopQA, WikiAsp, ASQA
+from src.custom_datasets import WikiMultiHopQA, WikiAsp, ASQA
 from src.utils import Utils
 
 

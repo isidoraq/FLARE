@@ -15,8 +15,9 @@ from transformers import GPT2TokenizerFast
 from tenacity import retry, stop_after_attempt, wait_fixed
 from .retriever import BM25
 from .templates import CtxPrompt, ApiReturn, RetrievalInstruction
-from .datasets import StrategyQA, WikiMultiHopQA, WikiAsp, ASQA
+from .custom_datasets import StrategyQA, WikiMultiHopQA, WikiAsp, ASQA
 from .utils import Utils, NoKeyAvailable, openai_api_call
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
@@ -78,26 +79,24 @@ class KeyManager:
             report.append(f'{key}\t{len(self.key2times[key])}\t{np.mean(self.key2times[key])}\t{key in self.forbid_keys}')
         return '\n'.join(report)
 
+import logging
+import numpy as np
+from tenacity import retry, stop_after_attempt, wait_fixed
+from elasticsearch.exceptions import ConnectionError as ESConnectionError
+from .retriever import BM25
+from .templates import CtxPrompt, ApiReturn
+from .utils import Utils, NoKeyAvailable, openai_api_call
+
+logging.basicConfig(level=logging.INFO)
 
 class QueryAgent:
-    def __init__(
-        self,
-        model: str = 'text-davinci-003',
-        max_generation_len: int = 128,
-        temperature: float = 0,
-        retrieval_kwargs: Dict[str, Any] = {},
-        tokenizer: GPT2TokenizerFast = None,
-    ):
+    def __init__(self, model: str, max_generation_len: int, temperature: float, retrieval_kwargs: Dict[str, Any], tokenizer):
         self.model = model
         self.tokenizer = tokenizer
-
-        # generation args
         self.final_stop_sym = retrieval_kwargs.get('final_stop_sym', '\n\n')
         self.max_generation_len = max_generation_len
         self.temperature = temperature
         self.top_p = 1.0
-
-        # retrieval args
         self.retriever = retrieval_kwargs.get('retriever', None)
         self.use_ctx = retrieval_kwargs.get('use_ctx', False)
         self.ret_frequency = retrieval_kwargs.get('frequency', 0)
@@ -105,11 +104,10 @@ class QueryAgent:
         self.truncate_at_boundary = retrieval_kwargs.get('truncate_at_boundary', None)
         self.ret_boundary = retrieval_kwargs.get('boundary', [])
         self.use_gold = retrieval_kwargs.get('use_gold', False)
-        if self.ret_boundary:  # otherwise cannot decide when to finally stop
+        if self.ret_boundary:
             assert self.final_stop_sym not in self.ret_boundary
         self.use_ctx_for_examplars = retrieval_kwargs.get('use_ctx_for_examplars', False)
         self.ctx_increase = retrieval_kwargs.get('ctx_increase', 'replace')
-
         self.look_ahead_steps = retrieval_kwargs.get('look_ahead_steps', 0)
         self.look_ahead_boundary = retrieval_kwargs.get('look_ahead_boundary', 0)
         self.look_ahead_truncate_at_boundary = retrieval_kwargs.get('look_ahead_truncate_at_boundary', None)
@@ -130,90 +128,60 @@ class QueryAgent:
         self.forbid_generate_step = retrieval_kwargs.get('forbid_generate_step', 0)
         self.use_gold_iterative = retrieval_kwargs.get('use_gold_iterative', False)
         self.reinit_ctx = retrieval_kwargs.get('reinit_ctx', False)
-
         self.ret_topk = retrieval_kwargs.get('topk', 1)
         self.debug = retrieval_kwargs.get('debug', False)
-
         self.retrieval_at_beginning = retrieval_kwargs.get('retrieval_at_beginning', False)
         if self.retrieval_at_beginning:
             if self.ret_frequency:
                 self.ret_frequency = self.max_generation_len
         self.regenerate_at_end = retrieval_kwargs.get('regenerate_at_end', False)
-
         self.frequency_penalty = retrieval_kwargs.get('frequency_penalty', 0.0)
         self.frequency_penalty_in_prompt = retrieval_kwargs.get('frequency_penalty_in_prompt', 0.0)
-
         self.prefix_method = retrieval_kwargs.get('prefix_method', None)
-        if self.prefix_method in {'sentence', 'all'} or (self.prefix_method and self.prefix_method.startswith('freq:')):  # no truncation when computing PPL
+        if self.prefix_method in {'sentence', 'all'} or (self.prefix_method and self.prefix_method.startswith('freq:')):
             self.truncate_at_prob = 0
             self.truncate_at_boundary = None
-            self.max_generation_len = 100000  # no limit
+            self.max_generation_len = 100000
 
     @property
     def use_retrieval(self):
         return self.ret_frequency > 0 or self.ret_boundary or self.use_gold
 
-    def get_tokens(self, text: str, topk: int) -> Tuple[str, int]:
-        assert topk >= 1
-        tokenized = self.tokenizer(text, return_offsets_mapping=True)
-        ids, offsets = tokenized['input_ids'][:topk], tokenized['offset_mapping'][:topk]
-        last_position = offsets[-1][1]
-        prefix = text[:last_position]
-        return prefix, last_position
-
     @retry(wait=wait_fixed(3), stop=stop_after_attempt(3))
-    def retrieve(
-        self,
-        queries: List[Union[str, List[str]]],
-        is_question: bool = False,
-    ):
-        mql = None if (self.use_full_input_as_query and is_question) else self.max_query_length
-        if len(queries) and type(queries[0]) is list:  # nested queries
-            flatten = sum(queries, [])
-            _ctx_ids, _ctx_texts = self.retriever.retrieve(
-                queries=flatten,
-                topk=self.ret_topk,
-                max_query_length=mql)
+    def retrieve(self, queries, is_question=False):
+        try:
+            logging.info(f"Attempting to retrieve for queries: {queries}")
+            mql = None if (self.use_full_input_as_query and is_question) else self.max_query_length
+            if len(queries) and isinstance(queries[0], list):
+                flatten = sum(queries, [])
+                _ctx_ids, _ctx_texts = self.retriever.retrieve(queries=flatten, topk=self.ret_topk, max_query_length=mql)
+                prev_ind = 0
+                ctx_ids, ctx_texts = [], []
+                for i in range(len(queries)):
+                    ctx_ids.append([])
+                    ctx_texts.append([])
+                    nqi = len(queries[i])
+                    cids, ctxts = _ctx_ids[prev_ind:prev_ind + nqi], _ctx_texts[prev_ind:prev_ind + nqi]
+                    assert cids.shape[-1] == ctxts.shape[-1] == self.ret_topk
+                    for j in range(self.ret_topk):
+                        for k in range(nqi):
+                            if cids[k, j] not in ctx_ids[-1]:
+                                ctx_ids[-1].append(cids[k, j])
+                                ctx_texts[-1].append(ctxts[k, j])
+                    ctx_ids[-1] = ctx_ids[-1][:self.ret_topk]
+                    ctx_texts[-1] = ctx_texts[-1][:self.ret_topk]
+                    prev_ind = prev_ind + nqi
+                ctx_ids = np.array(ctx_ids)
+                ctx_texts = np.array(ctx_texts)
+                assert ctx_ids.shape == ctx_texts.shape == (len(queries), self.ret_topk), f'inconsistent shapes: {ctx_ids.shape}, {ctx_texts.shape}, {queries}'
+            else:
+                ctx_ids, ctx_texts = self.retriever.retrieve(queries=queries, topk=self.ret_topk, max_query_length=mql)
+            return ctx_ids, ctx_texts
+        except ESConnectionError as e:
+            logging.error(f"Connection error during retrieval: {e}")
+            raise
 
-            # merge results
-            prev_ind = 0
-            ctx_ids, ctx_texts = [], []
-            for i in range(len(queries)):
-                ctx_ids.append([])
-                ctx_texts.append([])
-
-                nqi = len(queries[i])
-                cids, ctxts = _ctx_ids[prev_ind:prev_ind + nqi], _ctx_texts[prev_ind:prev_ind + nqi]
-                assert cids.shape[-1] == ctxts.shape[-1] == self.ret_topk
-                for j in range(self.ret_topk):
-                    for k in range(nqi):
-                        if cids[k, j] not in ctx_ids[-1]:
-                            ctx_ids[-1].append(cids[k, j])
-                            ctx_texts[-1].append(ctxts[k, j])
-                ctx_ids[-1] = ctx_ids[-1][:self.ret_topk]
-                ctx_texts[-1] = ctx_texts[-1][:self.ret_topk]
-                prev_ind = prev_ind + nqi
-
-            ctx_ids = np.array(ctx_ids)
-            ctx_texts = np.array(ctx_texts)
-            assert ctx_ids.shape == ctx_texts.shape == (len(queries), self.ret_topk), f'inconsistent shapes: {ctx_ids.shape}, {ctx_texts.shape}, {queries}'
-        else:
-            ctx_ids, ctx_texts = self.retriever.retrieve(
-                queries=queries,
-                topk=self.ret_topk,
-                max_query_length=mql)
-        return ctx_ids, ctx_texts
-
-    def complete(
-        self,
-        queries: List[CtxPrompt],
-        params: Dict[str, Any],
-        force_generate: int = None,
-        forbid_generate: int = None,
-        is_lookahead: bool = False,
-        api_key: str = None,
-    ) -> List[ApiReturn]:
-        # check model
+    def complete(self, queries: List[CtxPrompt], params: Dict[str, Any], force_generate: int = None, forbid_generate: int = None, is_lookahead: bool = False, api_key: str = None) -> List[ApiReturn]:
         is_chat_model = Utils.is_chat(self.model)
         if is_chat_model:
             assert len(queries) == 1, 'chatgpt doesn\'t support batching'
@@ -227,91 +195,52 @@ class QueryAgent:
             if 'max_tokens' in params:
                 params['max_tokens'] = max(2, params['max_tokens'])  # TODO: OPT doesn't have this bug, but openai returns nothing if set to 1
 
-
-        # logit bias
         logit_bias = dict()
         if force_generate:
             logit_bias={f'{force_generate[0]}': force_generate[1]}
         elif forbid_generate:
             logit_bias={f'{forbid_generate[0]}': -100}
 
-        # format to get the final prompt
+        if self.prefix_method:
+            for prefix_method in self.prefix_method:
+                if prefix_method == 'sentence_first:':
+                    params['max_tokens'] = 100000
+
         prompts: List[Tuple[str, int, List[str]]] = [q.format(use_ctx=self.use_ctx, is_chat_model=is_chat_model, api_key=api_key) for q in queries]
         prompts_to_issue: List[str] = list(map(itemgetter(0), prompts))
         demo_for_chat: List[str] = list(map(itemgetter(2), prompts))
 
-        # get prefix
         echo = False
         use_prefix = (self.prefix_method and self.prefix_method.startswith('sentence_first:')) or (self.prefix_method and not is_lookahead)
-        if use_prefix:  # prefix is not allowed to use in look ahead
+        if use_prefix:
             echo = True
             prefixes: List[Tuple[str, int]] = [q.get_prefix(qagent=self, prefix_method=self.prefix_method) for q in queries]
             to_gen_len = set(map(itemgetter(1), prefixes))
-            if None in to_gen_len:  # generate follow original settings
+            if None in to_gen_len:
                 pass
-            else:  # generate `to_gen_len` tokens
+            else:
                 params['max_tokens'] = max(to_gen_len)
             assert len(prompts_to_issue) == len(prefixes)
             for i in range(len(prompts_to_issue)):
                 prompts_to_issue[i] += prefixes[i][0]
 
-        # add penalty
         if self.frequency_penalty_in_prompt:
             assert len(queries) == 1, 'batching is not supported'
-            current_cases: List[str] = [q[-l:] if l else '' for q, l, _ in prompts]  # only use the generated content
+            current_cases: List[str] = [q[-l:] if l else '' for q, l, _ in prompts]
             counter = Counter(sum(self.tokenizer(current_cases)['input_ids'], []))
-            tokid2count: Dict[int, int] = dict(sorted(counter.items(), key=lambda x: (-x[1], x[0]))[:200])  # penalize at most 200 tokens
+            tokid2count: Dict[int, int] = dict(sorted(counter.items(), key=lambda x: (-x[1], x[0]))[:200])
             for tokid, count in tokid2count.items():
                 if tokid not in logit_bias:
                     logit_bias[str(tokid)] = 0
                 logit_bias[str(tokid)] -= self.frequency_penalty_in_prompt * count
 
-        # API call
         if is_chat_model:
-            messages=[  # system
-                {'role': 'system', 'content': 'Follow the given examples and answer the question.'},
-                {'role': 'system', 'content': 'You are a helpful assistant.'}
-            ] + [  # current example
-                {'role': 'user', 'content': prompts_to_issue[0]},
-            ]
-            responses = openai_api_call(
-                api_key=api_key,
-                model=self.model,
-                messages=messages,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                logit_bias=logit_bias,
-                frequency_penalty=self.frequency_penalty,
-                **params)
-
-            generations = [ApiReturn(
-                prompt=q,
-                text=(prefixes[0][0] + process_chatgpt(r['message']['content'])) if echo else process_chatgpt(r['message']['content']),  # TODO: corner case where space does not work?
-                finish_reason='length' if echo else r['finish_reason'],  # never stop in echo mode
-                model=responses['model'],
-                skip_len=0) for r, (q, _, _) in zip(responses['choices'], prompts)]
+            messages=[{'role': 'system', 'content': 'Follow the given examples and answer the question.'}, {'role': 'system', 'content': 'You are a helpful assistant.'}] + [{'role': 'user', 'content': prompts_to_issue[0]}]
+            responses = openai_api_call(api_key=api_key, model=self.model, messages=messages, temperature=self.temperature, top_p=self.top_p, logit_bias=logit_bias, frequency_penalty=self.frequency_penalty, **params)
+            generations = [ApiReturn(prompt=q, text=(prefixes[0][0] + process_chatgpt(r['message']['content'])) if echo else process_chatgpt(r['message']['content']), finish_reason='length' if echo else r['finish_reason'], model=responses['model'], skip_len=0) for r, (q, _, _) in zip(responses['choices'], prompts)]
         else:
-            responses = openai_api_call(
-                api_key=api_key,
-                model=self.model,
-                prompt=prompts_to_issue,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                logprobs=0,
-                logit_bias=logit_bias,
-                frequency_penalty=self.frequency_penalty,
-                echo=echo,
-                **params)
-
-            generations = [ApiReturn(
-                prompt=q,
-                text=r['text'],
-                tokens=r['logprobs']['tokens'],
-                probs=[np.exp(lp) if lp is not None else lp for lp in r['logprobs']['token_logprobs']],
-                offsets=r['logprobs']['text_offset'],
-                finish_reason='length' if echo else r['finish_reason'],  # never stop in echo mode
-                model=responses['model'],
-                skip_len=len(q) if echo else 0) for r, (q, _, _) in zip(responses['choices'], prompts)]
+            responses = openai_api_call(api_key=api_key, model=self.model, prompt=prompts_to_issue, temperature=self.temperature, top_p=self.top_p, logprobs=0, logit_bias=logit_bias, frequency_penalty=self.frequency_penalty, echo=echo, **params)
+            generations = [ApiReturn(prompt=q, text=r['text'], tokens=r['logprobs']['tokens'], probs=[np.exp(lp) if lp is not None else lp for lp in r['logprobs']['token_logprobs']], offsets=r['logprobs']['text_offset'], finish_reason='length' if echo else r['finish_reason'], model=responses['model'], skip_len=len(q) if echo else 0) for r, (q, _, _) in zip(responses['choices'], prompts)]
 
         if self.debug:
             print('Params ->', params)
@@ -325,254 +254,105 @@ class QueryAgent:
 
         return generations
 
-    def prompt(
-        self,
-        queries: List[CtxPrompt],
-        api_key: str = None,
-    ):
-        # update retrieval for ctx
+    def prompt(self, queries: List[CtxPrompt], api_key: str = None):
         if self.use_ctx_for_examplars:
-            for q in queries:
-                for d in q.demo:
+            for query in queries:
+                for d in query.demo:
                     d.update_retrieval(d.get_all_ctxs(), method=self.ctx_increase)
         if self.use_retrieval:
-            return self.ret_prompt(queries, api_key=api_key)
-        else:  # directly generate all without gold context
-            ars = self.complete(
-                queries,
-                params={'max_tokens': self.max_generation_len, 'stop': self.final_stop_sym},
-                api_key=api_key)
-            outputs = [ar.text for ar in ars]
-            probs = [ar.token_probs for ar in ars]
-            traces = [[(ar.prompt, ar.text)] for ar in ars]
+            outputs, probs, retrievals, traces = [], [], [], []
+            for query in queries:
+                output, prob, retrieval, trace = self.ret_prompt([query], api_key=api_key)
+                outputs.append(output)
+                probs.append(prob)
+                retrievals.append(retrieval)
+                traces.append(trace)
+            return outputs, probs, retrievals, traces
+        else:
+            outputs, probs, traces = [], [], []
+            for query in queries:
+                ars = self.complete([query], params={'max_tokens': self.max_generation_len, 'stop': self.final_stop_sym}, api_key=api_key)
+                outputs.append(ars[0].text)
+                probs.append(ars[0].token_probs)
+                traces.append([(ars[0].prompt, ars[0].text)])
             return outputs, probs, None, traces
 
-    def ret_prompt(
-        self,
-        queries: List[CtxPrompt],
-        api_key: str = None,
-        max_iteration: int = 10000,  # TODO: too high?
-    ):
-        batch_size = len(queries)
-        final_retrievals: List[List[Tuple[str, List[str]]]] = [[] for _ in range(len(queries))]  # (bs, n_ret_steps, ret_topk)
-        final_outputs: List[str] = [''] * len(queries)
-        final_probs: List[List[float]] = [[] for _ in range(len(queries))]
-        final_queries: List[CtxPrompt] = [None] * len(queries)
-        traces: List[List[Tuple[str, str]]] = [[] for _ in range(len(queries))]
-        queries: List[Tuple[int, CtxPrompt]] = [(i, q) for i, q in enumerate(queries)]  # to query
-        max_gen_len = 0
-
-        generate_queries: List[str] = []
-        first_ret = True
-        step_ind = 0
-        while len(queries) and max_gen_len < self.max_generation_len and step_ind <= max_iteration:
-            # reinit ctx to empty
-            if self.reinit_ctx:
-                for i, q in queries:
-                    q.reinit_ctx()
-
-            # retrieve
-            look_aheads: List[str] = [''] * len(queries)
-            if self.look_ahead_steps:  # generate a fixed number tokens for retrieval
-                if (self.look_ahead_pre_retrieval in {'first', 'first-keep'} and step_ind == 0) or self.look_ahead_pre_retrieval == 'all':  # pre-retrieval for look ahead
-                    queries_to_issue = [q.get_query_for_retrieval() for i, q in queries]
-                    ctx_ids, ctx_texts = self.retrieve(queries_to_issue, is_question=first_ret)
-                    for _i, (i, q) in enumerate(queries):
-                        ret_id, ret_text = ctx_ids[_i].tolist(), ctx_texts[_i].tolist()
-                        final_retrievals[i].append((queries_to_issue[_i], ret_id))
-                        q.update_retrieval(list(zip(ret_id, ret_text)), method=self.ctx_increase)
-                        if 'keep' in self.look_ahead_pre_retrieval:
-                            q._ctxs = list(zip(ret_id, ret_text))
-                # check ctx and kept ctx
-                for i, q in queries:
-                    q.check_ctx(method=self.ctx_increase)
-                apireturns = self.complete(
-                    list(map(itemgetter(1), queries)),
-                    params={'max_tokens': self.look_ahead_steps, 'stop': self.final_stop_sym},
-                    api_key=api_key,
-                    is_lookahead=True)
-                if self.look_ahead_truncate_at_boundary:
-                    apireturns = [ar.truncate_at_boundary(self.look_ahead_truncate_at_boundary) for ar in apireturns]
-                look_aheads = [ar.use_as_query(
-                    low_prob=self.look_ahead_filter_prob,
-                    mask_prob=self.look_ahead_mask_prob,
-                    mask_method=self.look_ahead_mask_method,
-                    n_gen_char_in_prompt=q.gen_len,
-                    api_key=api_key) for ar, (_, q) in zip(apireturns, queries)]
-            elif self.look_ahead_boundary:  # generate tokens until boundary for retrieval
-                apireturns = self.complete(
-                    list(map(itemgetter(1), queries)),
-                    params={'max_tokens': self.max_generation_len, 'stop': self.look_ahead_boundary},
-                    api_key=api_key,
-                    is_lookahead=True)
-                look_aheads = [ar.text for ar in apireturns]
-            assert len(look_aheads) == len(queries)
-
-            # send queries to index
-            if self.use_gold:
-                for i, q in queries:
-                    q.update_retrieval(q.get_all_ctxs(), method='replace')  # use all gold ctx
-            else:
-                if generate_queries:  # some queries might be None which means no queries are generated
-                    assert len(generate_queries) == len(queries)
-                    queries_to_issue = [lh if self.only_use_look_ahead else (gq + lh) for gq, lh in zip(generate_queries, look_aheads)]
-                else:
-                    queries_to_issue = [lh if self.only_use_look_ahead else (q.get_query_for_retrieval() + lh) for (i, q), lh in zip(queries, look_aheads)]
-                if self.debug:
-                    print(f'Query -> !{queries_to_issue[0]}!')
-                assert len(queries_to_issue) == len(queries)
-                nonemp_queries_to_issue = [q for q in queries_to_issue if q]
-                if nonemp_queries_to_issue and (not self.retrieval_at_beginning or first_ret):
-                    # (bs, ret_topk) * 2
-                    ctx_ids, ctx_texts = self.retrieve(nonemp_queries_to_issue, is_question=first_ret)
-                    idx = -1
-                    for _i, (i, q) in enumerate(queries):
-                        if queries_to_issue[_i]:
-                            idx += 1
-                            if self.use_gold_iterative:
-                                ret_id, ret_text = q.change_ctx()
-                                ret_id = [ret_id]
-                            else:
-                                ret_id, ret_text = ctx_ids[idx].tolist(), ctx_texts[idx].tolist()
-                            final_retrievals[i].append((queries_to_issue[_i], ret_id))
-                            q.update_retrieval(list(zip(ret_id, ret_text)), method=self.ctx_increase)
-                            if first_ret and 'first-keep' in self.pre_retrieval:
-                                q._ctxs = list(zip(ret_id, ret_text))
-                    first_ret = False
-
-            generate_queries = []
-            # check ctx and kept ctx
-            for i, q in queries:
-                q.check_ctx(method=self.ctx_increase)
-
-            # complete
-            if self.ret_frequency:
-                apireturns = self.complete(
-                    list(map(itemgetter(1), queries)),
-                    params={'max_tokens': min(self.max_generation_len - max_gen_len, self.ret_frequency), 'stop': self.final_stop_sym},
-                    api_key=api_key)
-                if self.truncate_at_prob > 0:
-                    apireturns = [ar.truncate_at_prob(self.truncate_at_prob) for ar in apireturns]
-                    max_gen_len += int(np.min([ar.num_tokens for ar in apireturns]))
-                    generate_queries = [ar.text for ar in apireturns]  # always use newly generated as query
-                elif self.truncate_at_boundary:
-                    apireturns = [ar.truncate_at_boundary(self.truncate_at_boundary) for ar in apireturns]
-                    max_gen_len += int(np.min([ar.num_tokens for ar in apireturns]))
-                    generate_queries = [ar.text for ar in apireturns]  # always use newly generated as query
-                else:
-                    max_gen_len += self.ret_frequency
-                for ar in apireturns:  # check final sym
-                    if self.final_stop_sym in ar.text:
-                        ar.finish_reason = 'stop'
-                    ar.truncate_at_substring(self.final_stop_sym)
-            elif self.ret_boundary:
-                if self.forbid_generate_step and self.retrieval_trigers and step_ind > 0:  # start from the second step to forbid the force_generate token
-                    _apireturns = self.complete(
-                        list(map(itemgetter(1), queries)),
-                        params={'max_tokens': min(self.max_generation_len - max_gen_len, self.forbid_generate_step), 'stop': self.final_stop_sym},
-                        forbid_generate=self.force_generate,
-                        api_key=api_key)
-                    for (i, query), ar in zip(queries, _apireturns):
-                        if not ar.is_empty:
-                            cont = ar.text
-                            final_outputs[i] += cont
-                            final_probs[i].extend(ar.token_probs or [])
-                            final_queries[i] = query
-                            traces[i].append((ar.prompt, cont))
-                            query.add_generation(cont)
-                apireturns = self.complete(
-                    list(map(itemgetter(1), queries)),
-                    params={'max_tokens': self.max_generation_len - max_gen_len, 'stop': self.ret_boundary},
-                    force_generate=self.force_generate,
-                    api_key=api_key)
-                if self.forbid_generate_step and self.retrieval_trigers and step_ind > 0:  # if the previous generation is empty, no need to continue
-                    assert len(apireturns) == len(_apireturns)
-                    apireturns = [_ar if _ar.is_empty else ar for ar, _ar in zip(apireturns, _apireturns)]
-
-                # used to collect the generation with ret_boundary
-                min_cont_len = 100000
-                for i, ar in enumerate(apireturns):
-                    cont, reason = ar.text, ar.finish_reason
-                    if ar.has_endoftext or ar.is_empty:  # 003 stops proactively by returning endoftext or when nothing is generated
-                        reason = 'stop'
-                        if self.retrieval_trigers:
-                            generate_queries.append('')
-                    elif reason == 'stop' and self.final_stop_sym not in cont:  # stop at ret_boundary
-                        reason = 'boundary'
-                        remove_query = False
-                        if self.retrieval_trigers:  # extract queries from generation
-                            assert len(self.retrieval_trigers) == 1
-                            # TODO: check if it stops at retrieval trigers
-                            ret_tri_start = self.retrieval_trigers[0][0]
-                            if ret_tri_start is None:  # use all generated tokens as query
-                                generate_queries.append(cont)
-                            else:
-                                found_query = re.search(ret_tri_start, cont)
-                                if found_query:
-                                    generate_queries.append(cont[found_query.span()[1]:].strip())
-                                    if self.forbid_generate_step:
-                                        remove_query = True
-                                        cont = cont[:found_query.span()[0]].rstrip()  # remove queries
-                                else:  # no retrieval query deteced, the generation is finished
-                                    generate_queries.append('')
-                                    reason = 'stop'
-                        assert len(self.ret_boundary) == 1
-                        if not remove_query and reason == 'boundary':
-                            cont += self.ret_boundary[0]
-                        #assert len(cont) > 0, 'empty generation will cause dead lock'
-                    else:
-                        if self.retrieval_trigers:
-                            generate_queries.append('')
-                    if self.final_stop_sym in cont:
-                        cont = cont.split(self.final_stop_sym, 1)[0]
-                        reason = 'stop'
-                    apireturns[i].text = cont
-                    apireturns[i].finish_reason = reason
-                    min_cont_len = min(min_cont_len, len(self.tokenizer.tokenize(cont)))
-                max_gen_len += min_cont_len
-            else:
-                raise NotImplementedError
-
-            # decide whether to continue
-            new_queries = []
-            new_generate_queries = []
-            assert len(queries) == len(apireturns)
-            if len(generate_queries):
-                assert len(queries) == len(generate_queries), f'{len(queries)} {len(generate_queries)}'
-            for _i, ((i, query), ar) in enumerate(zip(queries, apireturns)):
-                cont, reason = ar.text, ar.finish_reason
-                final_outputs[i] += cont
-                final_probs[i].extend(ar.token_probs)
-                final_queries[i] = query
-                traces[i].append((ar.prompt, cont))
-                if reason == 'stop':
-                    pass
-                elif reason in {'length', 'boundary'}:
-                    query.add_generation(cont)
-                    new_queries.append((i, query))
-                    if len(generate_queries):
-                        new_generate_queries.append(generate_queries[_i])
-                else:
-                    raise ValueError
-            queries = new_queries
-            generate_queries = new_generate_queries
-            step_ind += 1
-
-        if self.regenerate_at_end:  # regenerate given retrieval results
-            for query in final_queries:
-                query.reset_generation()
-            apireturns = self.complete(
-                final_queries,
-                params={'max_tokens': self.max_generation_len, 'stop': self.final_stop_sym},
-                api_key=api_key)
-            for i, (query, ar) in enumerate(zip(final_queries, apireturns)):
-                cont, reason = ar.text, ar.finish_reason
-                final_outputs[i] = cont
-                final_probs[i] = ar.token_probs
-                traces[i].append((ar.prompt, cont))
-
+    def ret_prompt(self, queries: List[CtxPrompt], api_key: str = None, max_iteration: int = 10000):
+        final_outputs, final_probs, final_retrievals, traces = [], [], [], []
+        for query in queries:
+            output, prob, retrieval, trace = self._ret_prompt_single(query, api_key=api_key, max_iteration=max_iteration)
+            final_outputs.append(output)
+            final_probs.append(prob)
+            final_retrievals.append(retrieval)
+            traces.append(trace)
         return final_outputs, final_probs, final_retrievals, traces
 
+    def _ret_prompt_single(self, query: CtxPrompt, api_key: str = None, max_iteration: int = 10000):
+        final_output = ""
+        final_probs = []
+        final_retrievals = []
+        traces = []
+        step_ind = 0
+        max_gen_len = 0
+        first_ret = True
+        while max_gen_len < self.max_generation_len and step_ind <= max_iteration:
+            if self.reinit_ctx:
+                query.reinit_ctx()
+            look_ahead = ""
+            if self.look_ahead_steps:
+                if (self.look_ahead_pre_retrieval in {'first', 'first-keep'} and step_ind == 0) or self.look_ahead_pre_retrieval == 'all':
+                    query_to_issue = query.get_query_for_retrieval()
+                    ctx_ids, ctx_texts = self.retrieve([query_to_issue], is_question=first_ret)
+                    ret_id, ret_text = ctx_ids[0].tolist(), ctx_texts[0].tolist()
+                    final_retrievals.append((query_to_issue, ret_id))
+                    query.update_retrieval(list(zip(ret_id, ret_text)), method=self.ctx_increase)
+                    if 'keep' in self.look_ahead_pre_retrieval:
+                        query._ctxs = list(zip(ret_id, ret_text))
+                query.check_ctx(method=self.ctx_increase)
+                ar = self.complete([query], params={'max_tokens': self.look_ahead_steps, 'stop': self.final_stop_sym}, api_key=api_key, is_lookahead=True)
+                if self.look_ahead_truncate_at_boundary:
+                    ar[0] = ar[0].truncate_at_boundary(self.look_ahead_truncate_at_boundary)
+                if ar[0].has_tokens:
+                    look_ahead = ar[0].use_as_query(low_prob=self.look_ahead_filter_prob, mask_prob=self.look_ahead_mask_prob, mask_method=self.look_ahead_mask_method, n_gen_char_in_prompt=query.gen_len, api_key=api_key)
+                else:
+                    look_ahead = ar[0].text
+            elif self.look_ahead_boundary:
+                ar = self.complete([query], params={'max_tokens': self.max_generation_len, 'stop': self.look_ahead_boundary}, api_key=api_key, is_lookahead=True)
+                look_ahead = ar[0].text
+            if self.use_gold:
+                query.update_retrieval(query.get_all_ctxs(), method='replace')
+            else:
+                if look_ahead:
+                    queries_to_issue = look_ahead
+                else:
+                    queries_to_issue = query.get_query_for_retrieval() + look_ahead
+                if queries_to_issue:
+                    ctx_ids, ctx_texts = self.retrieve([queries_to_issue], is_question=first_ret)
+                    ret_id, ret_text = ctx_ids[0].tolist(), ctx_texts[0].tolist()
+                    final_retrievals.append((queries_to_issue, ret_id))
+                    query.update_retrieval(list(zip(ret_id, ret_text)), method=self.ctx_increase)
+                    if 'first-keep' in self.pre_retrieval:
+                        query._ctxs = list(zip(ret_id, ret_text))
+            query.check_ctx(method=self.ctx_increase)
+            ar = self.complete([query], params={'max_tokens': min(self.max_generation_len - max_gen_len, self.ret_frequency), 'stop': self.final_stop_sym}, api_key=api_key)
+            if self.truncate_at_prob > 0:
+                ar[0] = ar[0].truncate_at_prob(self.truncate_at_prob)
+                max_gen_len += int(np.min([ar[0].num_tokens]))
+                look_ahead = ar[0].text
+            elif self.truncate_at_boundary:
+                ar[0] = ar[0].truncate_at_boundary(self.truncate_at_boundary)
+                max_gen_len += int(np.min([ar[0].num_tokens]))
+                look_ahead = ar[0].text
+            else:
+                max_gen_len += self.ret_frequency
+            if self.final_stop_sym in ar[0].text:
+                ar[0].text = ar[0].text.split(self.final_stop_sym, 1)[0]
+                ar[0].finish_reason = 'stop'
+            final_output += ar[0].text
+            final_probs.extend(ar[0].token_probs)
+            traces.append((ar[0].prompt, ar[0].text))
+            step_ind += 1
+        return final_output, final_probs, final_retrievals, traces
 
 def query_agent_worker(
     qagent: QueryAgent,

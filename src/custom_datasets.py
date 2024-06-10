@@ -5,6 +5,7 @@ import json
 import re
 import glob
 import string
+
 from collections import Counter
 from urllib.parse import unquote
 from tqdm import tqdm
@@ -12,6 +13,7 @@ import numpy as np
 import spacy
 from datasets import Dataset, concatenate_datasets, load_from_disk
 from beir.datasets.data_loader import GenericDataLoader
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
