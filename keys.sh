@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
 
 # the key used for debugging
-test_key="sk-___"
+OPENAI_API_KEY='sk-'
 
 # one or multiple keys used for running experiments
 declare -a keys=(
-    "sk-____"
-    "sk-____"
-    "sk-____"
+    'sk-'
 )
